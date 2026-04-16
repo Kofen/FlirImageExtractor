@@ -268,6 +268,8 @@ class FlirImageExtractor:
             "markers": [],
             "reference": None,
             "tool": "marker",
+            "dragging_marker": None,
+            "drag_start": None,
         }
 
         plot_values = self._get_plot_values(thermal_np, config, plot_state["sharpen_alpha"])
@@ -337,7 +339,7 @@ class FlirImageExtractor:
             marker["point"].set_offsets([[marker["x"], marker["y"]]])
             marker["annotation"].xy = (marker["x"], marker["y"])
             marker["annotation"].set_text(marker_text(marker))
-            marker["annotation"].set_position(style["offset"])
+            marker["annotation"].set_position(marker["offset"])
             marker["annotation"].get_bbox_patch().set(fc=style["color"], alpha=0.9)
 
         def refresh_all_markers():
@@ -383,6 +385,7 @@ class FlirImageExtractor:
                 "kind": kind,
                 "x": x_idx,
                 "y": y_idx,
+                "offset": style["offset"],
                 "point": point,
                 "annotation": annotation,
             }
@@ -409,6 +412,17 @@ class FlirImageExtractor:
                 return None
             return nearest_marker
 
+        def find_marker_from_event(event):
+            for marker in reversed(plot_state["markers"]):
+                contains_annotation, _ = marker["annotation"].contains(event)
+                if contains_annotation:
+                    return marker
+
+                contains_point, _ = marker["point"].contains(event)
+                if contains_point:
+                    return marker
+            return None
+
         def update_plot_image():
             plot_state["plot_values"] = self._get_plot_values(thermal_np, config, plot_state["sharpen_alpha"])
             im.set_data(plot_state["plot_values"])
@@ -426,17 +440,26 @@ class FlirImageExtractor:
                 im.set_norm(norm)
             refresh_all_markers()
 
-        def on_click(event):
+        def on_press(event):
             if event.inaxes != ax or event.xdata is None or event.ydata is None:
                 return
 
             x_idx = int(np.clip(np.round(event.xdata), 0, plot_state["plot_values"].shape[1] - 1))
             y_idx = int(np.clip(np.round(event.ydata), 0, plot_state["plot_values"].shape[0] - 1))
+            selected_marker = find_marker_from_event(event)
 
             if plot_state["tool"] == "delete":
-                marker = find_nearest_marker(x_idx, y_idx)
+                marker = selected_marker or find_nearest_marker(x_idx, y_idx)
                 if marker is not None:
                     remove_marker(marker)
+                return
+
+            if selected_marker is not None:
+                plot_state["dragging_marker"] = selected_marker
+                plot_state["drag_start"] = {
+                    "mouse_pixels": (event.x, event.y),
+                    "offset": selected_marker["offset"],
+                }
                 return
 
             if plot_state["tool"] == "marker":
@@ -445,6 +468,25 @@ class FlirImageExtractor:
                 add_marker(x_idx, y_idx, "reference")
             elif plot_state["tool"] == "delta":
                 add_marker(x_idx, y_idx, "delta")
+
+        def on_motion(event):
+            marker = plot_state["dragging_marker"]
+            drag_start = plot_state["drag_start"]
+            if marker is None or drag_start is None or event.x is None or event.y is None:
+                return
+
+            start_mouse_x, start_mouse_y = drag_start["mouse_pixels"]
+            start_offset_x, start_offset_y = drag_start["offset"]
+            pixels_to_points = 72.0 / fig.dpi
+            x_offset = int(round(start_offset_x + (event.x - start_mouse_x) * pixels_to_points))
+            y_offset = int(round(start_offset_y + (event.y - start_mouse_y) * pixels_to_points))
+            marker["offset"] = (x_offset, y_offset)
+            marker["annotation"].set_position(marker["offset"])
+            fig.canvas.draw_idle()
+
+        def on_release(_event):
+            plot_state["dragging_marker"] = None
+            plot_state["drag_start"] = None
 
         def on_scale_change(_value):
             if slider_state["updating"]:
@@ -521,7 +563,9 @@ class FlirImageExtractor:
             labelbottom=False,
             labelleft=False,
         )
-        fig.canvas.mpl_connect("button_press_event", on_click)
+        fig.canvas.mpl_connect("button_press_event", on_press)
+        fig.canvas.mpl_connect("motion_notify_event", on_motion)
+        fig.canvas.mpl_connect("button_release_event", on_release)
         set_tool("marker")
         plt.show()
 
