@@ -14,20 +14,16 @@ import subprocess
 from math import exp, log, sqrt
 
 import matplotlib.colors as mcolors
-import mplcursors
 import numpy as np
 import scipy
 import scienceplots
 from matplotlib import cm
 from matplotlib import pyplot as plt
+from matplotlib.widgets import Button, Slider
 from PIL import Image
 from scipy.ndimage import zoom
 
 from colormaps import get_colormap_config, get_colormap_names
-
-ref_mode = False
-delta_mode = False
-ref = 0
 
 
 class MidpointNormalize(mcolors.Normalize):
@@ -254,20 +250,33 @@ class FlirImageExtractor:
 
     def plot(self):
         thermal_np = self.get_thermal_np()
-        plot_data = self._build_plot_data(thermal_np)
         config = get_colormap_config(self.plot_colormap)
-        plot_values = plot_data[config["image_source"]]
-        norm = self._build_norm(config.get("norm"), thermal_np)
-        imshow_kwargs = dict(config.get("imshow_kwargs", {}))
-
-        if norm is None:
-            imshow_kwargs.setdefault("vmin", np.min(thermal_np))
-            imshow_kwargs.setdefault("vmax", np.max(thermal_np))
+        data_min = float(np.min(thermal_np))
+        data_max = float(np.max(thermal_np))
+        scale_step = max((data_max - data_min) / 200.0, 0.01)
+        slider_state = {"updating": False}
 
         fig, ax = plt.subplots(1, 1, figsize=(10, 8))
-        fig.set_tight_layout(True)
         plt.style.use(["science", "no-latex"])
+        plt.subplots_adjust(bottom=0.28)
 
+        plot_state = {
+            "plot_values": None,
+            "scale_min": data_min,
+            "scale_max": data_max,
+            "sharpen_alpha": 5.0,
+            "markers": [],
+            "reference": None,
+            "tool": "marker",
+        }
+
+        plot_values = self._get_plot_values(thermal_np, config, plot_state["sharpen_alpha"])
+        plot_state["plot_values"] = plot_values
+        norm = self._build_norm(config.get("norm"), thermal_np, plot_state["scale_min"], plot_state["scale_max"])
+        imshow_kwargs = dict(config.get("imshow_kwargs", {}))
+        if norm is None:
+            imshow_kwargs["vmin"] = plot_state["scale_min"]
+            imshow_kwargs["vmax"] = plot_state["scale_max"]
         im = ax.imshow(plot_values, cmap=config["cmap"], norm=norm, **imshow_kwargs)
         fig.colorbar(im, ax=ax, pad=0.02, fraction=0.062, label="Temperature [C]")
 
@@ -275,52 +284,232 @@ class FlirImageExtractor:
         print(meta_data.get("CameraModel"))
         print(meta_data.get("CameraSerialNumber"))
 
-        def toggle_reference(event):
-            global ref_mode
-            global delta_mode
-            if event.key == "r":
-                ref_mode = True
-                delta_mode = False
-                print("Reference point mode activated.")
-            elif event.key == "d":
-                ref_mode = False
-                delta_mode = True
-                print("Delta calculation mode activated.")
-            elif event.key == "n":
-                ref_mode = False
-                delta_mode = False
-                print("Normal calculation mode activated.")
+        marker_styles = {
+            "marker": {
+                "color": "#f5f5dc",
+                "marker": "o",
+                "label": "Marker",
+                "offset": (14, 14),
+            },
+            "reference": {
+                "color": "#c2ccec",
+                "marker": "s",
+                "label": "Reference",
+                "offset": (14, -18),
+            },
+            "delta": {
+                "color": "#f5b7b1",
+                "marker": "^",
+                "label": "Delta",
+                "offset": (-14, 14),
+            },
+        }
+        status_text = fig.text(0.02, 0.24, "", fontsize=10)
 
-        crs1 = mplcursors.cursor(hover=0, multiple=True)
-        crs2 = mplcursors.cursor(hover=2)
-        ds = r"$\degree$"
-        delta_symbol = r" $\Delta$"
+        def marker_value(marker):
+            return float(plot_state["plot_values"][marker["y"], marker["x"]])
 
-        @crs1.connect("add")
-        def on_add_primary(sel):
-            global ref
-            color = "#c2ccec" if ref_mode else "#f5f5dc"
-            i, j = sel.index
-            if delta_mode:
-                sel.annotation.set_text(f"{delta_symbol}{np.round(plot_values[i, j] - ref, 2)}{ds}C")
-            elif ref_mode:
-                sel.annotation.set_text(f"{np.round(plot_values[i, j], 2)}{ds}C")
-                ref = plot_values[i, j]
+        def set_tool(tool_name):
+            plot_state["tool"] = tool_name
+            status_labels = {
+                "marker": "Click image to add a marker",
+                "reference": "Click image to set the delta reference marker",
+                "delta": "Click image to add a delta marker",
+                "delete": "Click an existing marker to delete it",
+            }
+            status_text.set_text("Tool: {}".format(status_labels[tool_name]))
+            fig.canvas.draw_idle()
+
+        def marker_text(marker):
+            value = marker_value(marker)
+            if marker["kind"] == "reference":
+                return "Ref {:.2f} °C".format(value)
+            if marker["kind"] == "delta":
+                reference_marker = plot_state["reference"]
+                if reference_marker is None:
+                    return "Δ? °C\n{:.2f} °C".format(value)
+                delta_value = value - marker_value(reference_marker)
+                return "Δ{:.2f} °C\n{:.2f} °C".format(delta_value, value)
+            return "{:.2f} °C".format(value)
+
+        def refresh_marker(marker):
+            style = marker_styles[marker["kind"]]
+            marker["point"].set_offsets([[marker["x"], marker["y"]]])
+            marker["annotation"].xy = (marker["x"], marker["y"])
+            marker["annotation"].set_text(marker_text(marker))
+            marker["annotation"].set_position(style["offset"])
+            marker["annotation"].get_bbox_patch().set(fc=style["color"], alpha=0.9)
+
+        def refresh_all_markers():
+            for marker in plot_state["markers"]:
+                refresh_marker(marker)
+            fig.canvas.draw_idle()
+
+        def remove_marker(marker):
+            marker["point"].remove()
+            marker["annotation"].remove()
+            plot_state["markers"].remove(marker)
+            if plot_state["reference"] is marker:
+                plot_state["reference"] = None
+            refresh_all_markers()
+
+        def add_marker(x_idx, y_idx, kind):
+            if kind == "reference" and plot_state["reference"] is not None:
+                remove_marker(plot_state["reference"])
+
+            style = marker_styles[kind]
+            point = ax.scatter(
+                [x_idx],
+                [y_idx],
+                s=90,
+                c=style["color"],
+                marker=style["marker"],
+                edgecolors="black",
+                linewidths=0.8,
+                zorder=4,
+            )
+            annotation = ax.annotate(
+                "",
+                xy=(x_idx, y_idx),
+                xytext=style["offset"],
+                textcoords="offset points",
+                bbox=dict(boxstyle="round", fc=style["color"], alpha=0.9),
+                arrowprops=dict(arrowstyle="simple", fc="white", alpha=0.5),
+                fontsize=9,
+                zorder=5,
+            )
+
+            marker = {
+                "kind": kind,
+                "x": x_idx,
+                "y": y_idx,
+                "point": point,
+                "annotation": annotation,
+            }
+            plot_state["markers"].append(marker)
+
+            if kind == "reference":
+                plot_state["reference"] = marker
+
+            refresh_all_markers()
+
+        def find_nearest_marker(x_value, y_value, max_distance=12):
+            if not plot_state["markers"]:
+                return None
+
+            nearest_marker = None
+            nearest_distance = None
+            for marker in plot_state["markers"]:
+                distance = np.hypot(marker["x"] - x_value, marker["y"] - y_value)
+                if nearest_distance is None or distance < nearest_distance:
+                    nearest_distance = distance
+                    nearest_marker = marker
+
+            if nearest_distance is None or nearest_distance > max_distance:
+                return None
+            return nearest_marker
+
+        def update_plot_image():
+            plot_state["plot_values"] = self._get_plot_values(thermal_np, config, plot_state["sharpen_alpha"])
+            im.set_data(plot_state["plot_values"])
+
+            norm = self._build_norm(
+                config.get("norm"),
+                thermal_np,
+                plot_state["scale_min"],
+                plot_state["scale_max"],
+            )
+            if norm is None:
+                im.set_norm(None)
+                im.set_clim(plot_state["scale_min"], plot_state["scale_max"])
             else:
-                sel.annotation.set_text(f"{np.round(plot_values[i, j], 2)} {ds}C")
-            sel.annotation.arrow_patch.set(arrowstyle="simple", fc="white", alpha=0.5)
-            sel.annotation.get_bbox_patch().set(fc=color, alpha=0.9)
+                im.set_norm(norm)
+            refresh_all_markers()
 
-        @crs2.connect("add")
-        def on_add_secondary(sel):
-            color = "#c2ccec" if ref_mode else "#f5f5dc"
-            i, j = sel.index
-            if delta_mode:
-                sel.annotation.set_text(f"{delta_symbol}{np.round(plot_values[i, j] - ref, 2)}{ds}C")
-            else:
-                sel.annotation.set_text(f"{np.round(plot_values[i, j], 2)} {ds}C")
-            sel.annotation.arrow_patch.set(arrowstyle="simple", fc="white", alpha=0.5)
-            sel.annotation.get_bbox_patch().set(fc=color, alpha=0.9)
+        def on_click(event):
+            if event.inaxes != ax or event.xdata is None or event.ydata is None:
+                return
+
+            x_idx = int(np.clip(np.round(event.xdata), 0, plot_state["plot_values"].shape[1] - 1))
+            y_idx = int(np.clip(np.round(event.ydata), 0, plot_state["plot_values"].shape[0] - 1))
+
+            if plot_state["tool"] == "delete":
+                marker = find_nearest_marker(x_idx, y_idx)
+                if marker is not None:
+                    remove_marker(marker)
+                return
+
+            if plot_state["tool"] == "marker":
+                add_marker(x_idx, y_idx, "marker")
+            elif plot_state["tool"] == "reference":
+                add_marker(x_idx, y_idx, "reference")
+            elif plot_state["tool"] == "delta":
+                add_marker(x_idx, y_idx, "delta")
+
+        def on_scale_change(_value):
+            if slider_state["updating"]:
+                return
+
+            scale_min = min_slider.val
+            scale_max = max_slider.val
+            if scale_min >= scale_max:
+                slider_state["updating"] = True
+                if _value == scale_min:
+                    min_slider.set_val(scale_max - scale_step)
+                else:
+                    max_slider.set_val(scale_min + scale_step)
+                slider_state["updating"] = False
+                scale_min = min_slider.val
+                scale_max = max_slider.val
+
+            plot_state["scale_min"] = scale_min
+            plot_state["scale_max"] = scale_max
+            update_plot_image()
+
+        def on_sharpen_change(value):
+            plot_state["sharpen_alpha"] = value
+            update_plot_image()
+
+        button_specs = [
+            ("Add Marker", [0.12, 0.18, 0.16, 0.05], "marker"),
+            ("Set Reference", [0.31, 0.18, 0.16, 0.05], "reference"),
+            ("Add Delta", [0.50, 0.18, 0.16, 0.05], "delta"),
+            ("Delete Marker", [0.69, 0.18, 0.16, 0.05], "delete"),
+        ]
+
+        widgets = []
+        for label, rect, tool_name in button_specs:
+            button = Button(fig.add_axes(rect), label)
+            button.on_clicked(lambda _event, tool=tool_name: set_tool(tool))
+            widgets.append(button)
+
+        min_slider = Slider(
+            fig.add_axes([0.12, 0.11, 0.73, 0.03]),
+            "Scale Min",
+            data_min,
+            data_max - scale_step,
+            valinit=data_min,
+        )
+        max_slider = Slider(
+            fig.add_axes([0.12, 0.07, 0.73, 0.03]),
+            "Scale Max",
+            data_min + scale_step,
+            data_max,
+            valinit=data_max,
+        )
+        sharpen_slider = Slider(
+            fig.add_axes([0.12, 0.03, 0.73, 0.03]),
+            "Sharpen",
+            0.0,
+            10.0,
+            valinit=plot_state["sharpen_alpha"],
+        )
+        widgets.extend([min_slider, max_slider, sharpen_slider])
+        fig._flir_widgets = widgets
+
+        min_slider.on_changed(on_scale_change)
+        max_slider.on_changed(on_scale_change)
+        sharpen_slider.on_changed(on_sharpen_change)
 
         plt.tick_params(
             axis="both",
@@ -332,7 +521,8 @@ class FlirImageExtractor:
             labelbottom=False,
             labelleft=False,
         )
-        fig.canvas.mpl_connect("key_press_event", toggle_reference)
+        fig.canvas.mpl_connect("button_press_event", on_click)
+        set_tool("marker")
         plt.show()
 
     def _build_plot_data(self, thermal_np, zoom_factor=6, sharpen_alpha=5):
@@ -343,12 +533,14 @@ class FlirImageExtractor:
             "sharpened": sharpen_image(interpolated, sharpen_alpha),
         }
 
-    def _build_norm(self, norm_config, thermal_np):
+    def _build_norm(self, norm_config, thermal_np, vmin=None, vmax=None):
         if not norm_config:
             return None
 
-        vmin = np.min(thermal_np)
-        vmax = np.max(thermal_np)
+        if vmin is None:
+            vmin = np.min(thermal_np)
+        if vmax is None:
+            vmax = np.max(thermal_np)
         midpoint = norm_config.get("midpoint")
         if midpoint == "median":
             midpoint = np.median(thermal_np)
@@ -387,6 +579,10 @@ class FlirImageExtractor:
 
         cmap = cm.get_cmap(config["cmap"]) if isinstance(config["cmap"], str) else config["cmap"]
         return np.uint8(cmap(normalized) * 255)
+
+    def _get_plot_values(self, thermal_np, config, sharpen_alpha):
+        plot_data = self._build_plot_data(thermal_np, sharpen_alpha=sharpen_alpha)
+        return plot_data[config["image_source"]]
 
     def save_images(self):
         rgb_np = self.get_rgb_np()
